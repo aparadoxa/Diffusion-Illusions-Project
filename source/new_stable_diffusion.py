@@ -1,0 +1,436 @@
+# Peekaboo: Text to Image Diffusion Models Are Zero-Shot Segmentors
+#
+# Copyright (c) 2023 Ryan Burgert
+#
+# This code is based on the Stable-Dreamfusion codebase's 'sd.py' by Jiaxiang Tang (https://github.com/ashawkey/stable-dreamfusion)
+# which is licensed under the Apache License Version 2.0.
+# It has been heavily modified to suit Peekaboo's needs, but the basic concepts remain the same.
+# Tensor shape assertions have been added to the code to make it easier to read.
+#
+# Author: Ryan Burgert
+
+#TODO: Use loss, add type annotations to add/remove noise, add denoised image func for ddpm attempt
+
+from typing import Union,List,Optional
+
+from transformers import CLIPTextModel, CLIPTokenizer, logging
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, DDPMScheduler
+from diffusers import StableDiffusionPipeline
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from easydict import EasyDict
+
+import rp
+
+rp.fansi_print('Current Process: %i %s'%(rp.get_process_id(),rp.get_process_title()),'green','bold') #This should prob be done for every notebook!
+
+# Suppress partial model loading warning
+logging.set_verbosity_error()
+
+_stable_diffusion_singleton = None #This singleton gets set the first time a StableDiffusion is constructed. Usually you'll only ever make one.
+
+def _get_stable_diffusion_singleton():
+    if _stable_diffusion_singleton is None:
+        assert False, 'Please create a stable_diffusion.StableDiffusion instance before creating a label'
+    return _stable_diffusion_singleton
+
+
+class StableDiffusion(nn.Module):
+    def __init__(self, device='cuda', checkpoint_path="CompVis/stable-diffusion-v1-4"):
+        """
+        Some suggested checkpoint_path:
+            CompVis/stable-diffusion-v1-4      # 512 Base model 1.4
+            runwayml/stable-diffusion-v1-5     # 512 Base model 1.5
+            stabilityai/stable-diffusion-2     # 768 Base model 2.0
+            stabilityai/stable-diffusion-2-1   # 768 Base model 2.1
+            sd-dreambooth-library/fashion      # 512 Fashion stuff?
+            nitrosocke/mo-di-diffusion         # 512 Dreambooth: Use 'modern disney style' in prompt. Pixar style.
+            nitrosocke/archer-diffusion        # 512 Dreambooth: Use 'archer style' in prompt. Thick outline clean cartoon style.
+            nitrosocke/nitro-diffusion         # 512 Dreambooth: Use 'arcane style', 'archer style' and/or 'modern disney style' in your prompt
+            Envvi/Inkpunk-Diffusion            # 512 Dreambooth: Use 'nvinkpunk' in prompt. Looks kinda like borderlands, but more dramatic and artistic.
+            nitrosocke/classic-anim-diffusion  # 512 Dreambooth: Use 'classic disney style' in prompt. Old timey disney style.
+            nitrosocke/Ghibli-Diffusion        # 512 Dreambooth: Use 'ghibli style' in prompt. Studio Ghibli anime style.
+            hakurei/waifu-diffusion            # 512 Fine Tuned: No special prompting needed
+            hakurei/artstation-diffusion       # 512 Fine Tuned: No special prompting needed
+            prompthero/openjourney-v4          # 512 Fine Tuned: No special prompting needed
+        """
+        
+        #Set the singleton. Other classes such as Label need this.
+        global _stable_diffusion_singleton
+        if _stable_diffusion_singleton is not None:
+            rp.fansi_print('WARNING! StableDiffusion was instantiated twice!','yellow','bold')
+        _stable_diffusion_singleton=self
+            
+        super().__init__()
+
+        self.device = torch.device(device)
+        self.num_train_timesteps = 1000
+        
+        # Timestep ~ U(0.02, 0.98) to avoid very high/low noise levels
+        self.min_step = int(self.num_train_timesteps * 0.02) # aka 20
+        self.max_step = int(self.num_train_timesteps * 0.98) # aka 980
+
+        print(f'[INFO] StableDiffusion: loading checkpoint {repr(checkpoint_path)} ... please make sure you have run `huggingface-cli login` to enable downloads.')
+        
+        # Unlike the original code, I'll load these from the pipeline. This lets us use dreambooth models.
+        pipe = StableDiffusionPipeline.from_pretrained(pretrained_model_name_or_path=checkpoint_path, torch_dtype=torch.float, safety_checker=None, requires_safety_checker=False)
+    
+        # pipe.scheduler = DDIMScheduler.from_pretrained(pretrained_model_name_or_path=checkpoint_path, torch_dtype=torch.float, subfolder="scheduler")
+        pipe.scheduler = DDPMScheduler.from_pretrained(pretrained_model_name_or_path=checkpoint_path, torch_dtype=torch.float, subfolder="scheduler")
+        # pipe.scheduler = PNDMScheduler.from_pretrained(pretrained_model_name_or_path=checkpoint_path, torch_dtype=torch.float, subfolder="scheduler")
+        
+        self.pipe         = pipe
+        self.vae          = pipe.vae         .to(self.device) ; assert isinstance(self.vae          , AutoencoderKL       ),type(self.vae          )
+        self.tokenizer    = pipe.tokenizer                    ; assert isinstance(self.tokenizer    , CLIPTokenizer       ),type(self.tokenizer    )
+        self.text_encoder = pipe.text_encoder.to(self.device) ; assert isinstance(self.text_encoder , CLIPTextModel       ),type(self.text_encoder )
+        self.unet         = pipe.unet        .to(self.device) ; assert isinstance(self.unet         , UNet2DConditionModel),type(self.unet         )
+        self.scheduler    = pipe.scheduler                    ; #assert isinstance(self.scheduler    , PNDMScheduler       ),type(self.scheduler    )
+        
+        self.vae_resolution_factor = self.pipe.vae_scale_factor # Is always 8 in Stable Diffusion 1.x and 2.x. Refers to the resolution factor between latent and pixel space.
+        self.latent_channels    = self.vae.config['latent_channels'] # Is always 4 in Stable Diffusion 1.x and 2.x. Refers to the number of channels in latent space. Currently hard-coded as 4 throughout this module for brevity.
+        self.vae_scaling_factor = self.vae.config['scaling_factor'] # Is always 0.18215  in Stable Diffusion 1.x and 2.x. See AutoencoderKL's docstring for more info about this magic number.
+        self.height=self.width  = self.unet.config['sample_size']*self.vae_resolution_factor # Will be 512x512 for Stable Diffusion 1.x, and 768x768 for Stable Diffusion 2.x. The preferred Stable Diffusion height and width.
+
+        #Some unnesecary assertions; these just reflect what I currently know about the Stable Diffusion models currently out.
+        assert self.latent_channels==4
+        assert self.vae_resolution_factor==8
+        assert self.vae_scaling_factor==0.18215
+        assert (self.height,self.width) in {(512,512), (768,768)}
+        
+        
+        self.uncond_text=''
+
+        self.checkpoint_path=checkpoint_path
+            
+        self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
+
+        print(f'[INFO] StableDiffusion: loaded stable diffusion!')
+
+    def get_text_embeddings(self, prompts: Union[str, List[str]])->torch.Tensor:
+        
+        if isinstance(prompts,str):
+            prompts=[prompts]
+
+        # Tokenize text and get embeddings
+        text_input = self.tokenizer(prompts, padding='max_length', max_length=self.tokenizer.model_max_length, truncation=True, return_tensors='pt').input_ids
+
+        with torch.no_grad():
+            text_embeddings = self.text_encoder(text_input.to(self.device))[0]
+
+        # Do the same for unconditional embeddings
+        uncond_input = self.tokenizer([self.uncond_text] * len(prompts), padding='max_length', max_length=self.tokenizer.model_max_length, return_tensors='pt').input_ids
+
+        with torch.no_grad():
+            uncond_embeddings = self.text_encoder(uncond_input.to(self.device))[0]
+
+        assert len(uncond_embeddings)==len(text_embeddings)==len(prompts)==len(text_input)==len(uncond_input)
+
+        output_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+        assert (uncond_embeddings==torch.stack([uncond_embeddings[0]]*len(uncond_embeddings))).all()
+        assert (uncond_embeddings==uncond_embeddings[0][None]).all()
+
+        # assert output_embeddings.shape == (len(prompts)*2, 77, 768)
+
+        return output_embeddings
+
+    @staticmethod
+    def _calculate_sqrt_alpha_beta_prods(timesteps, scheduler, device):
+        """Calculate sqrt_alpha_prod and sqrt_beta_prod."""
+        #THESE NAMES ARE KINDA MISLEADING: its not the sqrt of the prod of the betas, it's 1-sqrt(prod of alphas)
+        #TODO: add shape assertions.
+        timesteps = timesteps.cpu()
+        sqrt_alpha_prod = (scheduler.alphas_cumprod[timesteps] ** 0.5)
+        sqrt_beta_prod = (1 - scheduler.alphas_cumprod[timesteps]) ** 0.5
+
+        # Reshape the tensors and move them to the same device as samples
+        sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(device)
+        sqrt_beta_prod = sqrt_beta_prod.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(device)
+
+        return sqrt_alpha_prod, sqrt_beta_prod
+
+    def add_noise(self, original_samples, noise, timesteps):
+        """Add noise to the original samples based on a predefined scheduler. Alternatively, you can use self.scheduler.add_noise, which should be equivalent."""
+        #HELP! This is no longer the inverse of remove_noise, what gives?? We might need it to be!
+        sqrt_alpha_prod, sqrt_beta_prod = self._calculate_sqrt_alpha_beta_prods(timesteps, self.scheduler, noise.device)
+        noisy_latents = sqrt_alpha_prod * original_samples + sqrt_beta_prod * noise
+        return noisy_latents
+
+    def remove_noise(self, noisy_latents, noise, timesteps):
+        """Remove noise from the noisy latents to recover the original samples. This function mathematically found in DDPMScheduler.step."""
+        #TODO: Make it subtract_noise instead?
+        sqrt_alpha_prod, sqrt_beta_prod = self._calculate_sqrt_alpha_beta_prods(timesteps, self.scheduler, noise.device)
+        assert self.scheduler.config.prediction_type in 'epsilon v_prediction sample'.split(), 'This code might be out of date. As of writing, these are the only three.'
+        if self.scheduler.config.prediction_type=='epsilon'     :original_samples = (noisy_latents - sqrt_beta_prod * noise) / sqrt_alpha_prod #Used in Stable Diffusion 1.x
+        if self.scheduler.config.prediction_type=='v_prediction':original_samples = sqrt_alpha_prod * noisy_latents - sqrt_beta_prod * noise   #Used in Stable Diffusion 2.x
+        if self.scheduler.config.prediction_type=='sample'      :original_samples = noise                                                      #Never used in anything I've seen
+        return original_samples
+
+    def predict_noise(self, noisy_latents, text_embeddings, timestep):
+        return self.unet(noisy_latents, timestep, encoder_hidden_states=text_embeddings)['sample']
+
+    def train_step(self, 
+                   text_embeddings:torch.Tensor,
+                   pred_rgb:torch.Tensor,
+                   guidance_scale:float=100,
+                   t:Optional[int]=None,
+                   noise_coef=1,
+                   latent_coef=0,
+                   image_coef=0,
+                   height=None,
+                   width=None,
+                   target=None, #If this is set, we don't perform any SD stuff. Currently this is a latent target! The code is messy! We also want image target later
+                   # image_target=None, #TODO: Implement this!
+                  ):
+        
+        # This method is responsible for generating the dream-loss gradients.
+        
+        if height is None:height=self.height
+        if width  is None:width =self.width
+
+        # interp to (height, width) to be fed into vae
+        pred_rgb_scaled = F.interpolate(pred_rgb, (height, width), mode='bilinear', align_corners=False)
+
+        if t is None:
+            t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
+
+        assert 0<=t<self.num_train_timesteps, 'invalid timestep t=%i'%t
+
+        # encode image into latents with vae, requires grad!
+        latents = self.encode_imgs(pred_rgb_scaled)
+
+        output=EasyDict()
+        
+        # predict the noise residual with unet, NO grad!
+        with torch.no_grad():
+            if target is None:
+                # add noise
+                noise = torch.randn_like(latents)
+                #This is the only place we use the scheduler...the add_noise function. What's more...it's totally generic! The scheduler doesn't impact the implementation of train_step...
+                latents_noisy = self.add_noise(latents, noise, t) #The add_noise function is identical for PNDM, DDIM, and DDPM schedulers in the diffusers library
+                #TODO: Expand this add_noise function, and put it in this class. That way we don't need the scheduler...and we can also add an inverse function, which is what I need for previews...that subtracts noise...
+                #Also, create a dream-loss-based image gen example notebook...
+
+                # pred noise
+                latent_model_input = torch.cat([latents_noisy] * 2)
+                noise_pred = self.predict_noise(latent_model_input, text_embeddings, t)
+
+
+                output.noise_pred=noise_pred #
+
+                latent_pred = self.remove_noise(latents_noisy, noise_pred, t)
+            else:
+                #Skip calculation and just set the latent_pred. Note that noise_pred isn't created, so we have to assume noise_coef is 0
+                assert not noise_coef, 'If the latent target is given we will not do any denoising, so the noise_coef should be 0!'
+                latent_pred = target
+            
+            deprecated_output = latent_pred
+            output.target=latent_pred #This can be used as a target for faster inference
+
+            if image_coef:
+                image_pred = self.decode_latents(latent_pred)
+                
+        #TODO: Different guidance scales for each type...if mixing them is useful...
+                
+        w = (1 - self.alphas[t])
+            
+        # perform noise guidance (high scale from paper!)
+        
+        total_delta=0
+        
+        if noise_coef:
+            assert target is None, 'If the latent target is given we will not do any denoising, so the noise_coef should be 0!'
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_delta=noise_pred - noise
+            total_delta=total_delta+noise_delta * noise_coef
+        
+        # Ryan's Latent Guidance
+        latent_pred_uncond, latent_pred_text = latent_pred.chunk(2)
+        latent_pred_guided = latent_pred_uncond + guidance_scale * (latent_pred_text - latent_pred_uncond)
+        latent_delta=latent_pred_guided - latents
+        latent_delta=-latent_delta #I don't know why, but it's backwards...I didn't analyze it too closely tho
+        total_delta=total_delta + latent_delta * latent_coef
+        
+        #Will this make a vram leak? I don't use them rn, so for now I'll comment them out just in case...maybe its fine idk
+        # output.latent_pred_uncond=latent_pred_uncond
+        # output.latent_pred_text=latent_pred_text
+        # output.latent_pred_guided=latent_pred_guided
+        
+        deprecated_output=torch.stack([*deprecated_output, *latent_pred_guided])
+        
+        if image_coef:
+            # Ryan's Image Guidance
+            image_pred_uncond, image_pred_text = image_pred.chunk(2)
+            image_pred = image_pred_uncond + guidance_scale * (image_pred_text - image_pred_uncond)
+            image_delta=image_pred - pred_rgb_scaled
+            image_delta=-image_delta#Same here...I don't know why, but it's backwards...I didn't analyze it too closely tho
+            pred_rgb_scaled.backward(gradient = w * image_delta * image_coef, retain_graph=True)
+
+
+        # w(t), sigma_t^2
+        grad = w * total_delta
+
+        # manually backward, since we omitted an item in grad and cannot simply autodiff
+        latents.backward(gradient=grad, retain_graph=True)
+        
+        output.deprecated_output=deprecated_output
+
+        return output
+
+    def produce_latents(self,
+                        text_embeddings:torch.Tensor,
+                        height:int=None,
+                        width:int=None,
+                        num_steps:int=None,
+                        guidance_scale:float=None,
+                        latents=None) ->torch.Tensor:
+        
+        if height is None:height=self.height
+        if width  is None:width =self.width
+        if num_steps is None:num_steps=50
+        if guidance_scale is None:guidance_scale=7.5
+
+        assert len(text_embeddings.shape)==3 # and text_embeddings.shape[-2:]==(77,768)
+        assert not len(text_embeddings)%2
+        num_prompts = len(text_embeddings)//2
+
+        if latents is None:
+            latents = torch.randn((num_prompts, self.unet.config.in_channels, height//self.vae_resolution_factor, width//self.vae_resolution_factor), device=self.device)
+
+        assert 0 <= num_steps <= 1000, 'Stable diffusion appears to be trained with 1000 timesteps'
+
+        self.scheduler.set_timesteps(num_steps)
+
+        with torch.autocast('cuda'):
+            for i, t in enumerate(self.scheduler.timesteps):
+                assert int(t) == t and 0 <= t <= 999, 'Suprisingly to me...the timesteps were encoded as integers lol (np.int64)'
+                assert int(i) == i and 0 <= i <= 999, 'And because there are 1000 of them, the index is also bounded'
+                # t=int(t) # This akes some schedulers happy; it's the same value anyway.
+
+                # Expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+                latent_model_input = torch.cat([latents] * 2) #The first half is the blank prompts (repeated); the second half is 
+
+                # predict the noise r['sample']
+                with torch.no_grad():
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+                    assert len(latent_model_input)==len(text_embeddings)==len(noise_pred)
+
+                # perform guidance
+                assert noise_pred.shape == (2*num_prompts, 4, height//self.vae_resolution_factor, width//self.vae_resolution_factor)
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                assert noise_pred.shape == (1*num_prompts, 4, height//self.vae_resolution_factor, width//self.vae_resolution_factor)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents)['prev_sample'] #It's a dict with nothing but 'prev_sample' in it
+                assert latents.shape==noise_pred.shape == (num_prompts, 4, height//self.vae_resolution_factor, width//self.vae_resolution_factor)
+
+        return latents
+
+    def decode_latents(self, latents:torch.Tensor)->torch.Tensor:
+
+        assert len(latents.shape) == 4 and latents.shape[1] == 4  # [B, 4, H, W]
+        
+        latents = 1 / self.vae_scaling_factor * latents
+        
+        imgs = self.vae.decode(latents)
+        if hasattr(imgs,'sample'):
+            #For newer versions of the Diffusers library
+            imgs=imgs.sample
+
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        
+        assert len(imgs.shape) == 4 and imgs.shape[1] == 3  # [B, 3, H, W]
+        
+        return imgs
+
+    def encode_imgs(self, imgs:torch.Tensor)->torch.Tensor:
+        
+        assert len(imgs.shape)==4 and imgs.shape[1]==3 #[B, 3, H, W]
+
+        imgs = 2 * imgs - 1
+        posterior = self.vae.encode(imgs)
+        latents = posterior.latent_dist.mean * self.vae_scaling_factor
+
+        assert len(latents.shape)==4 and latents.shape[1]==4 #[B, 4, H, W]
+
+        return latents
+
+    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+
+        assert len(latent.shape) == 3 and latent.shape[0] == 4  # [4, H, W]
+
+        img = self.decode_latents(latent[None])[0]
+
+        assert len(img.shape) == 3 and img.shape[0] == 3  # [3, H, W]
+
+        return img
+
+    def encode_img(self, img: torch.Tensor) -> torch.Tensor:
+
+        assert len(img.shape) == 3 and img.shape[0] == 3  # [3, H, W]
+
+        latent = self.encode_imgs(img[None])[0]
+
+        assert len(latent.shape) == 3 and latent.shape[0] == 4  # [4, H, W]
+
+        return latent
+    
+    def embeddings_to_imgs(self, text_embeddings:torch.Tensor, 
+                     height:int=None, 
+                     width:int=None,
+                     num_steps:int=None,
+                     guidance_scale:float=None, 
+                     latents:Optional[torch.Tensor]=None)->torch.Tensor:
+
+        if height is None:height=self.height
+        if width  is None:width =self.width
+    
+        assert len(text_embeddings.shape)==3# and text_embeddings.shape[1:]==(77,768)
+        assert not len(text_embeddings)%2
+        num_prompts=len(text_embeddings)//2
+
+        # text embeddings -> img latents
+        latents = self.produce_latents(text_embeddings, 
+                                       height=height, 
+                                       width=width, 
+                                       latents=latents, 
+                                       num_steps=num_steps,
+                                       guidance_scale=guidance_scale)
+        assert latents.shape==(num_prompts, 4, height//self.vae_resolution_factor, width//self.vae_resolution_factor)
+        
+        # img latents -> imgs
+        with torch.no_grad():
+            imgs = self.decode_latents(latents) 
+        assert imgs.shape==(num_prompts,3,height,width)
+
+        # torch imgs -> numpy imgs
+        imgs = rp.as_numpy_images(imgs)
+        assert imgs.shape==(num_prompts,height,width,3)
+ 
+        return imgs
+    
+    def prompts_to_imgs(self, prompts: List[str], 
+                        height:int=None, 
+                        width:int=None, 
+                        num_steps:int=None, 
+                        guidance_scale:float=None, 
+                        latents:Optional[torch.Tensor]=None)->torch.Tensor:
+
+        if height is None:height=self.height
+        if width  is None:width =self.width
+
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        # prompts -> text embeddings
+        text_embeddings = self.get_text_embeddings(prompts)
+        # assert text_embeddings.shape==( len(prompts)*2, 77, 768 )
+        
+        return self.embeddings_to_imgs(text_embeddings, height, width, num_steps, guidance_scale, latents)
+    
+    def prompt_to_img(self, prompt:str, *args, **kwargs)->torch.Tensor:
+        return self.prompts_to_imgs([prompt],*args,**kwargs)[0]

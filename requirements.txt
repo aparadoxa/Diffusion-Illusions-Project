@@ -1,0 +1,31 @@
+# --- 核心深度学习框架 ---
+torch
+torchvision
+
+# --- 图像处理与数据增强 ---
+Pillow
+opencv-python>=4.9.0.80
+imageio>=2.21.3
+matplotlib>=3.8.0
+
+# --- 数值计算与数据处理 ---
+numpy
+pandas>=2.0.0
+scipy
+
+# --- 深度学习工具库 ---
+einops>=0.6.0
+transformers
+diffusers
+accelerate
+# --- 可视化与日志 ---
+rich
+tqdm>=4.66.0
+tensorboard
+tensorboardX>=2.6
+
+# --- 其他工具 ---
+easydict
+icecream
+py3nvml
+rp
